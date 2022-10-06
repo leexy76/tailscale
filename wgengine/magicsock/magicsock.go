@@ -2830,9 +2830,9 @@ func (c *Conn) ReSTUN(why string) {
 	}
 }
 
-// listenPacket opens a packet listener.
+// listenPacketCommon opens a packet listener.
 // The network must be "udp4" or "udp6".
-func (c *Conn) listenPacket(network string, port uint16) (nettype.PacketConn, error) {
+func (c *Conn) listenPacketCommon(network string, port uint16) (nettype.PacketConn, error) {
 	ctx := context.Background() // unused without DNS name to resolve
 	addr := net.JoinHostPort("", fmt.Sprint(port))
 	if c.testOnlyPacketListener != nil {

@@ -15,3 +15,9 @@ import (
 func (c *Conn) listenRawDisco(family string) (io.Closer, error) {
 	return nil, errors.New("raw disco listening not supported on this OS")
 }
+
+// listenPacket opens a packet listener.
+// The network must be "udp4" or "udp6".
+func (c *Conn) listenPacket(network string, port uint16) (nettype.PacketConn, error) {
+	return c.listenPacketCommon(network, port)
+}

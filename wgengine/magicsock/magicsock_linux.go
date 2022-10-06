@@ -12,14 +12,21 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"sync"
 	"time"
 	"unsafe"
 
 	"golang.org/x/net/bpf"
+	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 	"golang.org/x/sys/unix"
+	"golang.zx2c4.com/wireguard/conn"
 	"tailscale.com/envknob"
+	"tailscale.com/health"
 	"tailscale.com/net/netns"
+	"tailscale.com/tstime/mono"
 	"tailscale.com/types/key"
+	"tailscale.com/types/nettype"
 )
 
 const (
@@ -287,4 +294,288 @@ func setBPF(conn net.PacketConn, filter []bpf.RawInstruction) error {
 		return err
 	}
 	return nil
+}
+
+type BatchReaderWriter interface {
+	BatchReader
+	BatchWriter
+}
+
+type BatchWriter interface {
+	WriteBatch([]ipv6.Message, int) (int, error)
+}
+
+type BatchReader interface {
+	ReadBatch([]ipv6.Message, int) (int, error)
+}
+
+type packetConnWithBatchOps struct {
+	nettype.PacketConn
+	xpc BatchReaderWriter
+}
+
+func (p packetConnWithBatchOps) WriteBatch(ms []ipv6.Message, flags int) (int, error) {
+	return p.xpc.WriteBatch(ms, flags)
+}
+
+func (p packetConnWithBatchOps) ReadBatch(ms []ipv6.Message, flags int) (int, error) {
+	return p.xpc.ReadBatch(ms, flags)
+}
+
+// listenPacket opens a packet listener.
+// The network must be "udp4" or "udp6".
+func (c *Conn) listenPacket(network string, port uint16) (nettype.PacketConn, error) {
+	pc, err := c.listenPacketCommon(network, port)
+	if err != nil {
+		return nil, err
+	}
+	pcbo := packetConnWithBatchOps{
+		PacketConn: pc,
+	}
+	switch network {
+	case "udp4":
+		pcbo.xpc = ipv4.NewPacketConn(pc)
+	case "udp6":
+		pcbo.xpc = ipv6.NewPacketConn(pc)
+	}
+	return pcbo, nil
+}
+
+func (c *Conn) SendV(buffs [][]byte, ep conn.Endpoint) error {
+	n := int64(len(buffs))
+	metricSendData.Add(n)
+	if c.networkDown() {
+		metricSendDataNetworkDown.Add(n)
+		return errNetworkDown
+	}
+	return ep.(*endpoint).sendv(buffs)
+}
+
+func (de *endpoint) sendv(buffs [][]byte) error {
+	now := mono.Now()
+
+	de.mu.Lock()
+	udpAddr, derpAddr := de.addrForSendLocked(now)
+	if de.canP2P() && (!udpAddr.IsValid() || now.After(de.trustBestAddrUntil)) {
+		de.sendPingsLocked(now, true)
+	}
+	de.noteActiveLocked()
+	de.mu.Unlock()
+
+	if !udpAddr.IsValid() && !derpAddr.IsValid() {
+		return errors.New("no UDP or DERP addr")
+	}
+	var err error
+	if udpAddr.IsValid() {
+		_, err = de.c.sendUDPBatch(udpAddr, buffs)
+	}
+	if derpAddr.IsValid() {
+		allOk := true
+		for _, buff := range buffs {
+			ok, _ := de.c.sendAddr(derpAddr, de.publicKey, buff)
+			if !ok {
+				allOk = false
+			}
+		}
+		if allOk {
+			return nil
+		}
+	}
+	return err
+}
+
+type sendBatch struct {
+	ua   *net.UDPAddr
+	msgs []ipv6.Message // ipv4.Message and ipv6.Message are the same underlying type
+}
+
+var (
+	sendBatchPool = &sync.Pool{
+		New: func() any {
+			ua := &net.UDPAddr{
+				IP: make([]byte, 0, 16),
+			}
+			msgs := make([]ipv6.Message, 128) // TODO: this len should be sourced from _somewhere_
+			for i := range msgs {
+				msgs[i].Buffers = make([][]byte, 1)
+				msgs[i].Addr = ua
+			}
+			return &sendBatch{
+				ua:   ua,
+				msgs: msgs,
+			}
+		},
+	}
+)
+
+func (c *Conn) sendUDPBatch(addr netip.AddrPort, buffs [][]byte) (sent bool, err error) {
+	batch := sendBatchPool.Get().(*sendBatch)
+	defer sendBatchPool.Put(batch)
+
+	isIPv6 := false
+	switch {
+	case addr.Addr().Is4():
+	case addr.Addr().Is6():
+		isIPv6 = true
+	default:
+		panic("bogus sendUDPBatch addr type")
+	}
+
+	as16 := addr.Addr().As16()
+	copy(batch.ua.IP, as16[:])
+	batch.ua.Port = int(addr.Port())
+	for i, buff := range buffs {
+		batch.msgs[i].Buffers[0] = buff
+	}
+
+	if isIPv6 {
+		_, err = c.pconn6.WriteBatch(batch.msgs[:len(buffs)], 0)
+	} else {
+		_, err = c.pconn4.WriteBatch(batch.msgs[:len(buffs)], 0)
+	}
+	return err == nil, err
+}
+
+func (c *blockForeverConn) WriteBatch(p []ipv4.Message, flags int) (int, error) {
+	// Silently drop writes.
+	return len(p), nil
+}
+
+func (c *RebindingUDPConn) WriteBatch(msgs []ipv6.Message, flags int) (int, error) {
+	for {
+		pconn := c.pconnAtomic.Load()
+		bw, ok := pconn.(BatchWriter)
+		if !ok {
+			return 0, errors.New("pconn is not a BatchWriter")
+		}
+
+		n, err := bw.WriteBatch(msgs, flags)
+		if err != nil {
+			if pconn != c.currentConn() {
+				continue
+			}
+		}
+		return n, err
+	}
+}
+
+func (c *RebindingUDPConn) ReadBatch(msgs []ipv6.Message, flags int) (int, error) {
+	for {
+		pconn := c.pconnAtomic.Load()
+		br, ok := pconn.(BatchReader)
+		if !ok {
+			panic("pconn is not a BatchReader")
+		}
+		n, err := br.ReadBatch(msgs, flags)
+		if err != nil && pconn != c.currentConn() {
+			continue
+		}
+		return n, err
+	}
+}
+
+type receiveBatch struct {
+	msgs      []ipv6.Message
+	sizes     []int
+	endpoints []conn.Endpoint
+}
+
+func init() {
+	n := 128 // TODO: source this len from _somewhere_
+	for _, b := range []*receiveBatch{ipv4ReceiveBatch, ipv6ReceiveBatch, derpReceiveBatch} {
+		msgs := make([]ipv6.Message, n)
+		for i := range msgs {
+			msgs[i].Buffers = make([][]byte, 1)
+		}
+		*b = receiveBatch{
+			msgs:      msgs,
+			sizes:     make([]int, n),
+			endpoints: make([]conn.Endpoint, n),
+		}
+	}
+}
+
+var (
+	ipv4ReceiveBatch, ipv6ReceiveBatch, derpReceiveBatch *receiveBatch
+)
+
+func (c *Conn) receiveMultipleIPv4(buffs [][]byte) ([]int, []conn.Endpoint, error) {
+	health.ReceiveIPv4.Enter()
+	defer health.ReceiveIPv4.Exit()
+
+	for {
+		batch := ipv4ReceiveBatch
+		for i := range buffs {
+			batch.msgs[i].Buffers[0] = buffs[i]
+		}
+		numMsgs, err := c.pconn4.ReadBatch(batch.msgs, 0)
+		if err != nil {
+			return nil, nil, err
+		}
+		for i := 0; i < numMsgs; i++ {
+			msg := &batch.msgs[i]
+			msg.Buffers[0] = msg.Buffers[0][:msg.N]
+			ipp := msg.Addr.(*net.UDPAddr).AddrPort()
+			if ep, ok := c.receiveIP(msg.Buffers[0], ipp, &c.ippEndpoint4, c.closeDisco4 == nil); ok {
+				metricRecvDataIPv4.Add(1)
+				batch.sizes[i] = msg.N
+				batch.endpoints[i] = ep
+			} else {
+				batch.sizes[i] = 0
+			}
+		}
+		if len(batch.sizes) > 0 {
+			return batch.sizes[:numMsgs], batch.endpoints[:numMsgs], nil
+		}
+	}
+}
+
+func (c *Conn) receiveMultipleIPv6(buffs [][]byte) ([]int, []conn.Endpoint, error) {
+	health.ReceiveIPv6.Enter()
+	defer health.ReceiveIPv6.Exit()
+
+	for {
+		batch := ipv6ReceiveBatch
+		for i := range buffs {
+			batch.msgs[i].Buffers[0] = buffs[i]
+		}
+		numMsgs, err := c.pconn6.ReadBatch(batch.msgs, 0)
+		if err != nil {
+			return nil, nil, err
+		}
+		for i := 0; i < numMsgs; i++ {
+			msg := &batch.msgs[i]
+			msg.Buffers[0] = msg.Buffers[0][:msg.N]
+			ipp := msg.Addr.(*net.UDPAddr).AddrPort()
+			if ep, ok := c.receiveIP(msg.Buffers[0], ipp, &c.ippEndpoint6, c.closeDisco6 == nil); ok {
+				metricRecvDataIPv6.Add(1)
+				batch.sizes[i] = msg.N
+				batch.endpoints[i] = ep
+			} else {
+				batch.sizes[i] = 0
+			}
+		}
+		if len(batch.sizes) > 0 {
+			return batch.sizes[:numMsgs], batch.endpoints[:numMsgs], nil
+		}
+	}
+}
+
+func (c *connBind) receiveMultipleDERP(b [][]byte) (sizes []int, eps []conn.Endpoint, err error) {
+	batch := derpReceiveBatch
+	n, ep, err := c.receiveDERP(b[0])
+	batch.sizes[0] = n
+	batch.endpoints[0] = ep
+	return batch.sizes[:1], batch.endpoints[:1], err
+}
+
+func (c *connBind) OpenV(_ uint16) ([]conn.ReceiveVFunc, uint16, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.closed {
+		return nil, 0, errors.New("magicsock: connBind already open")
+	}
+	c.closed = false
+	fns := []conn.ReceiveVFunc{c.receiveMultipleIPv4, c.receiveMultipleIPv6, c.receiveMultipleDERP}
+	return fns, c.LocalPort(), nil
 }
