@@ -75,8 +75,9 @@ type Wrapper struct {
 	logf        logger.Logf
 	limitedLogf logger.Logf // aggressively rate-limited logf used for potentially high volume errors
 	// tdev is the underlying Wrapper device.
-	tdev  tun.Device
-	isTAP bool // whether tdev is a TAP device
+	tdev       tun.Device
+	isTAP      bool           // whether tdev is a TAP device
+	vectorMode tun.VectorMode // whether and in what way we support vector reads and writes
 
 	closeOnce sync.Once
 
@@ -201,7 +202,7 @@ func Wrap(logf logger.Logf, tdev tun.Device) *Wrapper {
 
 func wrap(logf logger.Logf, tdev tun.Device, isTAP bool) *Wrapper {
 	logf = logger.WithPrefix(logf, "tstun: ")
-	tun := &Wrapper{
+	w := &Wrapper{
 		logf:        logf,
 		limitedLogf: logger.RateLimitedFn(logf, 1*time.Minute, 2, 10),
 		isTAP:       isTAP,
@@ -218,13 +219,21 @@ func wrap(logf logger.Logf, tdev tun.Device, isTAP bool) *Wrapper {
 		filterFlags: filter.LogAccepts | filter.LogDrops,
 	}
 
-	go tun.poll()
-	go tun.pumpEvents()
-	// The buffer starts out consumed.
-	tun.bufferConsumed <- struct{}{}
-	tun.noteActivity()
+	vd, ok := tdev.(tun.VectorDevice)
+	if ok && vd.Mode() != tun.VectorDisable {
+		w.vectorMode = tun.VectorOnly
+		go w.pollVector()
+	} else {
+		w.vectorMode = tun.VectorDisable
+		go w.poll()
+	}
 
-	return tun
+	go w.pumpEvents()
+	// The buffer starts out consumed.
+	w.bufferConsumed <- struct{}{}
+	w.noteActivity()
+
+	return w
 }
 
 // SetDestIPActivityFuncs sets a map of funcs to run per packet
@@ -367,6 +376,12 @@ func allowSendOnClosedChannel() {
 
 const ethernetFrameSize = 14 // 2 six byte MACs, 2 bytes ethertype
 
+// poll polls t.tdev.ReadV(), placing the oldest unconsumed vector of packets
+// into t.vectorBuffer.
+func (t *Wrapper) pollVector() {
+	// TODO: implement
+}
+
 // poll polls t.tdev.Read, placing the oldest unconsumed packet into t.buffer.
 // This is needed because t.tdev.Read in general may block (it does on Windows),
 // so packets may be stuck in t.outbound if t.Read called t.tdev.Read directly.
@@ -464,7 +479,7 @@ func (t *Wrapper) filterOut(p *packet.Parsed) filter.Response {
 	// Issue 1526 workaround: if we sent disco packets over
 	// Tailscale from ourselves, then drop them, as that shouldn't
 	// happen unless a networking stack is confused, as it seems
-	// macOS in Network Extension mode might be.
+	// macOS in Network Extension vectorMode might be.
 	if p.IPProto == ipproto.UDP && // disco is over UDP; avoid isSelfDisco call for TCP/etc
 		t.isSelfDisco(p) {
 		t.limitedLogf("[unexpected] received self disco out packet over tstun; dropping")
@@ -516,6 +531,15 @@ func (t *Wrapper) noteActivity() {
 // If there's never been activity, the duration is since the wrapper was created.
 func (t *Wrapper) IdleDuration() time.Duration {
 	return mono.Since(t.lastActivityAtomic.LoadAtomic())
+}
+
+func (t *Wrapper) Mode() tun.VectorMode {
+	return t.vectorMode
+}
+
+func (t *Wrapper) ReadV(buffs [][]byte, offset int) ([]int, error) {
+	// TODO: implement
+	return nil, nil
 }
 
 func (t *Wrapper) Read(buf []byte, offset int) (int, error) {
@@ -670,6 +694,33 @@ func (t *Wrapper) filterIn(buf []byte) filter.Response {
 	}
 
 	return filter.Accept
+}
+
+func (t *Wrapper) WriteV(buffs [][]byte, offset int) (int, error) {
+	metricPacketIn.Add(int64(len(buffs)))
+	swallowed := 0
+	if !t.disableFilter {
+		for i := range buffs {
+			if t.filterIn(buffs[i][offset:]) != filter.Accept {
+				metricPacketInDrop.Add(1)
+				swallowed += len(buffs[i][offset:])
+				buffs = append(buffs[:i], buffs[i+1:]...)
+			}
+		}
+	}
+
+	t.noteActivity()
+	total, err := t.tdevWriteV(&buffs, offset)
+	return total + swallowed, err
+}
+
+func (t *Wrapper) tdevWriteV(buffs *[][]byte, offset int) (int, error) {
+	if t.stats.enabled.Load() {
+		for i := range *buffs {
+			t.stats.UpdateRx((*buffs)[i][offset:])
+		}
+	}
+	return t.tdev.(tun.VectorDevice).WriteV(*buffs, offset)
 }
 
 // Write accepts an incoming packet. The packet begins at buf[offset:],

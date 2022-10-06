@@ -395,7 +395,7 @@ var (
 			ua := &net.UDPAddr{
 				IP: make([]byte, 0, 16),
 			}
-			msgs := make([]ipv6.Message, 128) // TODO: this len should be sourced from _somewhere_
+			msgs := make([]ipv6.Message, conn.MaxPacketVectorSize)
 			for i := range msgs {
 				msgs[i].Buffers = make([][]byte, 1)
 				msgs[i].Addr = ua
@@ -481,7 +481,7 @@ type receiveBatch struct {
 }
 
 func init() {
-	n := 128 // TODO: source this len from _somewhere_
+	n := conn.MaxPacketVectorSize
 	for _, b := range []*receiveBatch{ipv4ReceiveBatch, ipv6ReceiveBatch, derpReceiveBatch} {
 		msgs := make([]ipv6.Message, n)
 		for i := range msgs {

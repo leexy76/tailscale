@@ -2,7 +2,7 @@ module tailscale.com
 
 go 1.19
 
-replace golang.zx2c4.com/wireguard => github.com/tailscale/wireguard-go v0.0.20201119-0.20221005231432-b6388709d18d
+replace golang.zx2c4.com/wireguard => github.com/tailscale/wireguard-go v0.0.20201119-0.20221006223241-0376a51047b6
 
 require (
 	filippo.io/mkcert v1.4.3
