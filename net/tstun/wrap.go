@@ -241,9 +241,10 @@ func wrap(logf logger.Logf, tdev tun.Device, isTAP bool) *Wrapper {
 		bufferConsumed: make(chan struct{}, 1),
 		closed:         make(chan struct{}),
 		// outbound can be unbuffered; the buffer is an optimization.
-		outbound:     make(chan tunReadResult, 1),
-		eventsUpDown: make(chan tun.Event),
-		eventsOther:  make(chan tun.Event),
+		outbound:       make(chan tunReadResult, 1),
+		vectorOutbound: make(chan tunVectorReadResult, 1),
+		eventsUpDown:   make(chan tun.Event),
+		eventsOther:    make(chan tun.Event),
 		// TODO(dmytro): (highly rate-limited) hexdumps should happen on unknown packets.
 		filterFlags: filter.LogAccepts | filter.LogDrops,
 	}
@@ -624,7 +625,7 @@ func (t *Wrapper) ReadV(buffs [][]byte, offset int) ([]int, error) {
 		}
 	}
 
-	for i := range res.data {
+	for i := range res.dataSizes {
 		handleData(res.data[i][offset:offset+res.dataSizes[i]], i)
 	}
 	if res.onDataConsumed != nil {
@@ -793,6 +794,7 @@ func (t *Wrapper) WriteV(buffs [][]byte, offset int) (int, error) {
 	metricPacketIn.Add(int64(len(buffs)))
 	swallowed := 0
 	if !t.disableFilter {
+		// TODO(jwhited): this is broken and dropping unnecessarily, fix it
 		for i := range buffs {
 			if t.filterIn(buffs[i][offset:]) != filter.Accept {
 				metricPacketInDrop.Add(1)

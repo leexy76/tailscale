@@ -393,7 +393,7 @@ var (
 	sendBatchPool = &sync.Pool{
 		New: func() any {
 			ua := &net.UDPAddr{
-				IP: make([]byte, 0, 16),
+				IP: make([]byte, 16),
 			}
 			msgs := make([]ipv6.Message, conn.MaxPacketVectorSize)
 			for i := range msgs {
@@ -426,6 +426,7 @@ func (c *Conn) sendUDPBatch(addr netip.AddrPort, buffs [][]byte) (sent bool, err
 	batch.ua.Port = int(addr.Port())
 	for i, buff := range buffs {
 		batch.msgs[i].Buffers[0] = buff
+		batch.msgs[i].Addr = batch.ua
 	}
 
 	if isIPv6 {
@@ -496,7 +497,9 @@ func init() {
 }
 
 var (
-	ipv4ReceiveBatch, ipv6ReceiveBatch, derpReceiveBatch *receiveBatch
+	ipv4ReceiveBatch = &receiveBatch{}
+	ipv6ReceiveBatch = &receiveBatch{}
+	derpReceiveBatch = &receiveBatch{}
 )
 
 func (c *Conn) receiveMultipleIPv4(buffs [][]byte) ([]int, []conn.Endpoint, error) {
