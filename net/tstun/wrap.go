@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"go4.org/mem"
+	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -90,24 +91,30 @@ type Wrapper struct {
 	destMACAtomic  syncs.AtomicValue[[6]byte]
 	discoKey       syncs.AtomicValue[key.DiscoPublic]
 
+	// vectorBuffer stores the oldest unconsumed packet vector from tdev.
+	vectorBuffer [][]byte
 	// buffer stores the oldest unconsumed packet from tdev.
 	// It is made a static buffer in order to avoid allocations.
 	buffer [maxBufferSize]byte
-	// bufferConsumedMu protects bufferConsumed from concurrent sends and closes.
-	// It does not prevent send-after-close, only data races.
+	// bufferConsumedMu protects bufferConsumed from concurrent sends, closes,
+	// and send-after-close (by way of bufferConsumedClosed).
 	bufferConsumedMu sync.Mutex
+	// bufferConsumedClosed is true when bufferConsumed has been closed. This is
+	// read by bufferConsumed writers to prevent send-after-close.
+	bufferConsumedClosed bool
 	// bufferConsumed synchronizes access to buffer (shared by Read and poll).
 	//
-	// Close closes bufferConsumed. There may be outstanding sends to bufferConsumed
-	// when that happens; we catch any resulting panics.
-	// This lets us avoid expensive multi-case selects.
+	// Close closes bufferConsumed and sets bufferConsumedClosed to true.
 	bufferConsumed chan struct{}
 
 	// closed signals poll (by closing) when the device is closed.
 	closed chan struct{}
-	// outboundMu protects outbound from concurrent sends and closes.
-	// It does not prevent send-after-close, only data races.
+	// outboundMu protects outbound and vectorOutbound from concurrent sends,
+	// closes, and send-after-close (by way of outboundClosed).
 	outboundMu sync.Mutex
+	// outboundClosed is true when outbound has been closed. This is read by
+	// outbound and vectorOutbound writers to prevent send-after-close.
+	outboundClosed bool
 	// outbound is the queue by which packets leave the TUN device.
 	//
 	// The directions are relative to the network, not the device:
@@ -119,10 +126,10 @@ type Wrapper struct {
 	// Empty reads are skipped by WireGuard, so it is always legal
 	// to discard an empty packet instead of sending it through t.outbound.
 	//
-	// Close closes outbound. There may be outstanding sends to outbound
-	// when that happens; we catch any resulting panics.
-	// This lets us avoid expensive multi-case selects.
+	// Close closes outbound and sets outboundClosed to true.
 	outbound chan tunReadResult
+	// vectorOutbound behaves like outbound, but is for vectors.
+	vectorOutbound chan tunVectorReadResult
 
 	// eventsUpDown yields up and down tun.Events that arrive on a Wrapper's events channel.
 	eventsUpDown chan tun.Event
@@ -177,15 +184,37 @@ type Wrapper struct {
 	}
 }
 
-// tunReadResult is the result of a TUN read, or an injected result pretending to be a TUN read.
-// The data is not interpreted in the usual way for a Read method.
-// See the comment in the middle of Wrap.Read.
+// tunReadResult is the result of a tun.Read(), or an injected result pretending
+// to be a tun.Read().
 type tunReadResult struct {
 	// Only one of err, packet or data should be set, and are read in that order
 	// of precedence.
 	err    error
 	packet *stack.PacketBuffer
 	data   []byte
+
+	// Downstream consumers should call this if non-nil when they are done
+	// with data.
+	onDataConsumed func()
+
+	// injected is set if the read result was generated internally, and contained packets should not
+	// pass through filters.
+	injected bool
+}
+
+// tunVectorReadResult is the result of a tun.ReadV(), or an injected result
+// pretending to be a TUN read.
+type tunVectorReadResult struct {
+	// Only one of err or data should be set, and are read in that order
+	// of precedence.
+	err        error
+	data       [][]byte
+	dataOffset int
+	dataSizes  []int // TODO(jwhited): this will probably end up on the heap
+
+	// Downstream consumers should call this if non-nil when they are done
+	// with data.
+	onDataConsumed func()
 
 	// injected is set if the read result was generated internally, and contained packets should not
 	// pass through filters.
@@ -222,6 +251,10 @@ func wrap(logf logger.Logf, tdev tun.Device, isTAP bool) *Wrapper {
 	vd, ok := tdev.(tun.VectorDevice)
 	if ok && vd.Mode() != tun.VectorDisable {
 		w.vectorMode = tun.VectorOnly
+		w.vectorBuffer = make([][]byte, conn.MaxPacketVectorSize)
+		for i := range w.vectorBuffer {
+			w.vectorBuffer[i] = make([]byte, maxBufferSize)
+		}
 		go w.pollVector()
 	} else {
 		w.vectorMode = tun.VectorDisable
@@ -274,10 +307,13 @@ func (t *Wrapper) Close() error {
 	t.closeOnce.Do(func() {
 		close(t.closed)
 		t.bufferConsumedMu.Lock()
+		t.bufferConsumedClosed = true
 		close(t.bufferConsumed)
 		t.bufferConsumedMu.Unlock()
 		t.outboundMu.Lock()
+		t.outboundClosed = true
 		close(t.outbound)
+		close(t.vectorOutbound)
 		t.outboundMu.Unlock()
 		err = t.tdev.Close()
 	})
@@ -356,30 +392,29 @@ func (t *Wrapper) Name() (string, error) {
 	return t.tdev.Name()
 }
 
-// allowSendOnClosedChannel suppresses panics due to sending on a closed channel.
-// This allows us to avoid synchronization between poll and Close.
-// Such synchronization (particularly multi-case selects) is too expensive
-// for code like poll or Read that is on the hot path of every packet.
-// If this makes you sad or angry, you may want to join our
-// weekly Go Performance Delinquents Anonymous meetings on Monday nights.
-func allowSendOnClosedChannel() {
-	r := recover()
-	if r == nil {
-		return
-	}
-	e, _ := r.(error)
-	if e != nil && e.Error() == "send on closed channel" {
-		return
-	}
-	panic(r)
-}
-
 const ethernetFrameSize = 14 // 2 six byte MACs, 2 bytes ethertype
 
-// poll polls t.tdev.ReadV(), placing the oldest unconsumed vector of packets
+// pollVector polls t.tdev.ReadV(), placing the oldest unconsumed packet vector
 // into t.vectorBuffer.
 func (t *Wrapper) pollVector() {
-	// TODO: implement
+	vd, _ := t.tdev.(tun.VectorDevice)
+	for range t.bufferConsumed {
+		var n []int
+		var err error
+		for len(n) == 0 && err == nil {
+			if t.isClosed() {
+				return
+			}
+			n, err = vd.ReadV(t.vectorBuffer[:], PacketStartOffset)
+		}
+		t.sendVectorOutbound(tunVectorReadResult{
+			data:           t.vectorBuffer,
+			dataOffset:     PacketStartOffset,
+			dataSizes:      n,
+			err:            err,
+			onDataConsumed: t.sendBufferConsumed,
+		})
+	}
 }
 
 // poll polls t.tdev.Read, placing the oldest unconsumed packet into t.buffer.
@@ -430,26 +465,43 @@ func (t *Wrapper) poll() {
 				t.logf("tap regular frame: %x", t.buffer[PacketStartOffset:PacketStartOffset+n])
 			}
 		}
-		t.sendOutbound(tunReadResult{data: t.buffer[PacketStartOffset : PacketStartOffset+n], err: err})
+		t.sendOutbound(tunReadResult{
+			data:           t.buffer[PacketStartOffset : PacketStartOffset+n],
+			err:            err,
+			onDataConsumed: t.sendBufferConsumed,
+		})
 	}
 }
 
 // sendBufferConsumed does t.bufferConsumed <- struct{}{}.
-// It protects against any panics or data races that that send could cause.
 func (t *Wrapper) sendBufferConsumed() {
-	defer allowSendOnClosedChannel()
 	t.bufferConsumedMu.Lock()
 	defer t.bufferConsumedMu.Unlock()
+	if t.bufferConsumedClosed {
+		return
+	}
 	t.bufferConsumed <- struct{}{}
 }
 
-// sendOutbound does t.outboundMu <- r.
-// It protects against any panics or data races that that send could cause.
+// sendOutbound does t.outbound <- r.
 func (t *Wrapper) sendOutbound(r tunReadResult) {
-	defer allowSendOnClosedChannel()
 	t.outboundMu.Lock()
 	defer t.outboundMu.Unlock()
+	// TODO(jwhited): what do in vector mode? we still need to handle injected packets
+	if t.outboundClosed {
+		return
+	}
 	t.outbound <- r
+}
+
+// sendVectorOutbound does t.vectorOutbound <- r.
+func (t *Wrapper) sendVectorOutbound(r tunVectorReadResult) {
+	t.outboundMu.Lock()
+	defer t.outboundMu.Unlock()
+	if t.outboundClosed {
+		return
+	}
+	t.vectorOutbound <- r
 }
 
 var (
@@ -479,7 +531,7 @@ func (t *Wrapper) filterOut(p *packet.Parsed) filter.Response {
 	// Issue 1526 workaround: if we sent disco packets over
 	// Tailscale from ourselves, then drop them, as that shouldn't
 	// happen unless a networking stack is confused, as it seems
-	// macOS in Network Extension vectorMode might be.
+	// macOS in Network Extension mode might be.
 	if p.IPProto == ipproto.UDP && // disco is over UDP; avoid isSelfDisco call for TCP/etc
 		t.isSelfDisco(p) {
 		t.limitedLogf("[unexpected] received self disco out packet over tstun; dropping")
@@ -538,8 +590,50 @@ func (t *Wrapper) Mode() tun.VectorMode {
 }
 
 func (t *Wrapper) ReadV(buffs [][]byte, offset int) ([]int, error) {
-	// TODO: implement
-	return nil, nil
+	res, ok := <-t.vectorOutbound
+	if !ok {
+		return nil, io.EOF
+	}
+	if res.err != nil {
+		return nil, res.err
+	}
+
+	metricPacketOut.Add(int64(len(res.data)))
+
+	handleData := func(data []byte, i int) {
+		p := parsedPacketPool.Get().(*packet.Parsed)
+		defer parsedPacketPool.Put(p)
+		p.Decode(data)
+		if m := t.destIPActivity.Load(); m != nil {
+			if fn := m[p.Dst.Addr()]; fn != nil {
+				fn()
+			}
+		}
+		if !res.injected && !t.disableFilter {
+			response := t.filterOut(p)
+			if response != filter.Accept {
+				metricPacketOutDrop.Add(1)
+				res.dataSizes = append(res.dataSizes[:i], res.dataSizes[i+1:]...)
+				return
+			}
+		}
+		parsedPacketPool.Put(p)
+		copy(buffs[i][offset:], data)
+		if t.stats.enabled.Load() {
+			t.stats.UpdateTx(data)
+		}
+	}
+
+	for i := range res.data {
+		handleData(res.data[i][offset:offset+res.dataSizes[i]], i)
+	}
+	if res.onDataConsumed != nil {
+		// We are done with t.vectorBuffer. Let pollVector() re-use it.
+		res.onDataConsumed()
+	}
+
+	t.noteActivity()
+	return res.dataSizes, nil
 }
 
 func (t *Wrapper) Read(buf []byte, offset int) (int, error) {
@@ -565,10 +659,9 @@ func (t *Wrapper) Read(buf []byte, offset int) (int, error) {
 	} else {
 		n = copy(buf[offset:], res.data)
 
-		// t.buffer has a fixed location in memory.
-		if &res.data[0] == &t.buffer[PacketStartOffset] {
-			// We are done with t.buffer. Let poll re-use it.
-			t.sendBufferConsumed()
+		if res.onDataConsumed != nil {
+			// We are done with t.buffer. Let poll() re-use it.
+			res.onDataConsumed()
 		}
 	}
 
