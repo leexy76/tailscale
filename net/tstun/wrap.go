@@ -618,7 +618,6 @@ func (t *Wrapper) ReadV(buffs [][]byte, offset int) ([]int, error) {
 				return
 			}
 		}
-		parsedPacketPool.Put(p)
 		copy(buffs[i][offset:], data)
 		if t.stats.enabled.Load() {
 			t.stats.UpdateTx(data)
