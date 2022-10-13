@@ -114,8 +114,9 @@ type Wrapper struct {
 	// outboundMu protects outbound and vectorOutbound from concurrent sends,
 	// closes, and send-after-close (by way of outboundClosed).
 	outboundMu sync.Mutex
-	// outboundClosed is true when outbound has been closed. This is read by
-	// outbound and vectorOutbound writers to prevent send-after-close.
+	// outboundClosed is true when outbound or vectorOutbound have been closed.
+	// This is read by outbound and vectorOutbound writers to prevent
+	// send-after-close.
 	outboundClosed bool
 	// outbound is the queue by which packets leave the TUN device.
 	//
@@ -130,8 +131,9 @@ type Wrapper struct {
 	//
 	// Close closes outbound and sets outboundClosed to true.
 	outbound chan tunReadResult
-	// vectorOutbound behaves like outbound, but is for vectors.
-	vectorOutbound chan tunVectorReadResult
+	// vectorOutbound behaves like outbound, but is for vectors or single packet
+	// reads/injections.
+	vectorOutbound chan tunReadOpResult
 
 	// eventsUpDown yields up and down tun.Events that arrive on a Wrapper's events channel.
 	eventsUpDown chan tun.Event
@@ -186,6 +188,13 @@ type Wrapper struct {
 	}
 }
 
+// tunReadOpResult enables the passing of tunReadResult & tunVectorReadResult
+// types on the same channel, which allows us to avoid multi-channel select when
+// mixing vector and single packet operations.
+type tunReadOpResult interface {
+	isTunReadOpResult()
+}
+
 // tunReadResult is the result of a tun.Read(), or an injected result pretending
 // to be a tun.Read().
 type tunReadResult struct {
@@ -200,20 +209,19 @@ type tunReadResult struct {
 	injected bool
 }
 
-// tunVectorReadResult is the result of a tun.ReadV(), or an injected result
-// pretending to be a TUN read.
+func (t tunReadResult) isTunReadOpResult() {}
+
+// tunVectorReadResult is the result of a tun.ReadV().
 type tunVectorReadResult struct {
-	// Only one of err or data should be set, and are read in that order
-	// of precedence.
+	// Only one of err or data should be set, and are read in that order of
+	// precedence.
 	err        error
 	data       [][]byte
 	dataOffset int
-	dataSizes  []int // TODO(jwhited): this will probably end up on the heap
-
-	// injected is set if the read result was generated internally, and contained packets should not
-	// pass through filters.
-	injected bool
+	dataSizes  []int
 }
+
+func (t tunVectorReadResult) isTunReadOpResult() {}
 
 func WrapTAP(logf logger.Logf, tdev tun.Device) *Wrapper {
 	return wrap(logf, tdev, true)
@@ -236,7 +244,7 @@ func wrap(logf logger.Logf, tdev tun.Device, isTAP bool) *Wrapper {
 		closed:         make(chan struct{}),
 		// outbound can be unbuffered; the buffer is an optimization.
 		outbound:       make(chan tunReadResult, 1),
-		vectorOutbound: make(chan tunVectorReadResult, 1),
+		vectorOutbound: make(chan tunReadOpResult, 1),
 		eventsUpDown:   make(chan tun.Event),
 		eventsOther:    make(chan tun.Event),
 		// TODO(dmytro): (highly rate-limited) hexdumps should happen on unknown packets.
@@ -477,15 +485,19 @@ func (t *Wrapper) sendBufferConsumed() {
 	t.bufferConsumed <- struct{}{}
 }
 
-// sendOutbound does t.outbound <- r.
+// sendOutbound does t.outbound <- r or t.vectorOutbound <- r depending on the
+// t.Mode().
 func (t *Wrapper) sendOutbound(r tunReadResult) {
 	t.outboundMu.Lock()
 	defer t.outboundMu.Unlock()
-	// TODO(jwhited): what do in vector mode? we still need to handle injected packets
 	if t.outboundClosed {
 		return
 	}
-	t.outbound <- r
+	if t.Mode() == tun.VectorOnly {
+		t.vectorOutbound <- r
+	} else {
+		t.outbound <- r
+	}
 }
 
 // sendVectorOutbound does t.vectorOutbound <- r.
@@ -584,10 +596,16 @@ func (t *Wrapper) Mode() tun.VectorMode {
 }
 
 func (t *Wrapper) ReadV(buffs [][]byte, offset int) ([]int, error) {
-	res, ok := <-t.vectorOutbound
+	op, ok := <-t.vectorOutbound
 	if !ok {
 		return nil, io.EOF
 	}
+	single, ok := op.(tunReadResult)
+	if ok {
+		n, err := t.read(single, buffs[0], offset)
+		return []int{n}, err // TODO(jwhited): heap?
+	}
+	res, _ := op.(tunVectorReadResult)
 	if res.err != nil {
 		return nil, res.err
 	}
@@ -603,7 +621,7 @@ func (t *Wrapper) ReadV(buffs [][]byte, offset int) ([]int, error) {
 				fn()
 			}
 		}
-		if !res.injected && !t.disableFilter {
+		if !t.disableFilter {
 			response := t.filterOut(p)
 			if response != filter.Accept {
 				metricPacketOutDrop.Add(1)
@@ -618,9 +636,8 @@ func (t *Wrapper) ReadV(buffs [][]byte, offset int) ([]int, error) {
 	}
 
 	for i := range res.dataSizes {
-		handleData(res.data[i][offset:offset+res.dataSizes[i]], i)
+		handleData(res.data[i][res.dataOffset:res.dataOffset+res.dataSizes[i]], i)
 	}
-
 	// t.vectorBuffer has a fixed location in memory.
 	if len(res.data) > 0 &&
 		len(res.data[0]) >= res.dataOffset &&
@@ -633,12 +650,7 @@ func (t *Wrapper) ReadV(buffs [][]byte, offset int) ([]int, error) {
 	return res.dataSizes, nil
 }
 
-func (t *Wrapper) Read(buf []byte, offset int) (int, error) {
-	res, ok := <-t.outbound
-	if !ok {
-		// Wrapper is closed.
-		return 0, io.EOF
-	}
+func (t *Wrapper) read(res tunReadResult, buf []byte, offset int) (int, error) {
 	if res.err != nil {
 		return 0, res.err
 	}
@@ -688,6 +700,15 @@ func (t *Wrapper) Read(buf []byte, offset int) (int, error) {
 	}
 	t.noteActivity()
 	return n, nil
+}
+
+func (t *Wrapper) Read(buf []byte, offset int) (int, error) {
+	res, ok := <-t.outbound
+	if !ok {
+		// Wrapper is closed.
+		return 0, io.EOF
+	}
+	return t.read(res, buf, offset)
 }
 
 func (t *Wrapper) filterIn(buf []byte) filter.Response {
@@ -795,7 +816,8 @@ func (t *Wrapper) WriteV(buffs [][]byte, offset int) (int, error) {
 			if t.filterIn(buffs[i][offset:]) != filter.Accept {
 				metricPacketInDrop.Add(1)
 				swallowed += len(buffs[i][offset:])
-				buffs = append(buffs[:i], buffs[i+1:]...)
+				// TODO(jwhited): fix cut while iterating
+				//buffs = append(buffs[:i], buffs[i+1:]...)
 			}
 		}
 	}
@@ -843,6 +865,7 @@ func (t *Wrapper) Write(buf []byte, offset int) (int, error) {
 }
 
 func (t *Wrapper) tdevWrite(buf []byte, offset int) (int, error) {
+	// TODO(jwhited): injected writes while in vector mode should funnel to t.tdevWriteV()
 	if t.stats.enabled.Load() {
 		t.stats.UpdateRx(buf[offset:])
 	}

@@ -443,6 +443,11 @@ func (c *blockForeverConn) WriteBatch(p []ipv4.Message, flags int) (int, error) 
 }
 
 func (c *RebindingUDPConn) WriteBatch(msgs []ipv6.Message, flags int) (int, error) {
+	var (
+		n     int
+		err   error
+		start int
+	)
 	for {
 		pconn := c.pconnAtomic.Load()
 		bw, ok := pconn.(BatchWriter)
@@ -450,13 +455,17 @@ func (c *RebindingUDPConn) WriteBatch(msgs []ipv6.Message, flags int) (int, erro
 			return 0, errors.New("pconn is not a BatchWriter")
 		}
 
-		n, err := bw.WriteBatch(msgs, flags)
+		n, err = bw.WriteBatch(msgs[start:], flags)
 		if err != nil {
 			if pconn != c.currentConn() {
 				continue
 			}
+			return n, err
+		} else if n == len(msgs[start:]) {
+			return len(msgs), nil
+		} else {
+			start += n
 		}
-		return n, err
 	}
 }
 
