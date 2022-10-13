@@ -91,7 +91,8 @@ type Wrapper struct {
 	destMACAtomic  syncs.AtomicValue[[6]byte]
 	discoKey       syncs.AtomicValue[key.DiscoPublic]
 
-	// vectorBuffer stores the oldest unconsumed packet vector from tdev.
+	// vectorBuffer stores the oldest unconsumed packet vector from tdev. It is
+	// allocated in wrap() and the underlying arrays should never grow.
 	vectorBuffer [][]byte
 	// buffer stores the oldest unconsumed packet from tdev.
 	// It is made a static buffer in order to avoid allocations.
@@ -102,7 +103,8 @@ type Wrapper struct {
 	// bufferConsumedClosed is true when bufferConsumed has been closed. This is
 	// read by bufferConsumed writers to prevent send-after-close.
 	bufferConsumedClosed bool
-	// bufferConsumed synchronizes access to buffer (shared by Read and poll).
+	// bufferConsumed synchronizes access to buffer or vectorBuffer (shared by
+	// Read()/ReadV() and poll()/pollVector()).
 	//
 	// Close closes bufferConsumed and sets bufferConsumedClosed to true.
 	bufferConsumed chan struct{}
@@ -193,10 +195,6 @@ type tunReadResult struct {
 	packet *stack.PacketBuffer
 	data   []byte
 
-	// Downstream consumers should call this if non-nil when they are done
-	// with data.
-	onDataConsumed func()
-
 	// injected is set if the read result was generated internally, and contained packets should not
 	// pass through filters.
 	injected bool
@@ -211,10 +209,6 @@ type tunVectorReadResult struct {
 	data       [][]byte
 	dataOffset int
 	dataSizes  []int // TODO(jwhited): this will probably end up on the heap
-
-	// Downstream consumers should call this if non-nil when they are done
-	// with data.
-	onDataConsumed func()
 
 	// injected is set if the read result was generated internally, and contained packets should not
 	// pass through filters.
@@ -251,6 +245,7 @@ func wrap(logf logger.Logf, tdev tun.Device, isTAP bool) *Wrapper {
 
 	vd, ok := tdev.(tun.VectorDevice)
 	if ok && vd.Mode() != tun.VectorDisable {
+		// we either perform vector io or we don't
 		w.vectorMode = tun.VectorOnly
 		w.vectorBuffer = make([][]byte, conn.MaxPacketVectorSize)
 		for i := range w.vectorBuffer {
@@ -409,11 +404,10 @@ func (t *Wrapper) pollVector() {
 			n, err = vd.ReadV(t.vectorBuffer[:], PacketStartOffset)
 		}
 		t.sendVectorOutbound(tunVectorReadResult{
-			data:           t.vectorBuffer,
-			dataOffset:     PacketStartOffset,
-			dataSizes:      n,
-			err:            err,
-			onDataConsumed: t.sendBufferConsumed,
+			data:       t.vectorBuffer,
+			dataOffset: PacketStartOffset,
+			dataSizes:  n,
+			err:        err,
 		})
 	}
 }
@@ -467,9 +461,8 @@ func (t *Wrapper) poll() {
 			}
 		}
 		t.sendOutbound(tunReadResult{
-			data:           t.buffer[PacketStartOffset : PacketStartOffset+n],
-			err:            err,
-			onDataConsumed: t.sendBufferConsumed,
+			data: t.buffer[PacketStartOffset : PacketStartOffset+n],
+			err:  err,
 		})
 	}
 }
@@ -627,9 +620,13 @@ func (t *Wrapper) ReadV(buffs [][]byte, offset int) ([]int, error) {
 	for i := range res.dataSizes {
 		handleData(res.data[i][offset:offset+res.dataSizes[i]], i)
 	}
-	if res.onDataConsumed != nil {
-		// We are done with t.vectorBuffer. Let pollVector() re-use it.
-		res.onDataConsumed()
+
+	// t.vectorBuffer has a fixed location in memory.
+	if len(res.data) > 0 &&
+		len(res.data[0]) >= res.dataOffset &&
+		&res.data[0][res.dataOffset] == &t.vectorBuffer[0][PacketStartOffset] {
+		// We are done with t.buffer. Let poll() re-use it.
+		t.sendBufferConsumed()
 	}
 
 	t.noteActivity()
@@ -659,9 +656,10 @@ func (t *Wrapper) Read(buf []byte, offset int) (int, error) {
 	} else {
 		n = copy(buf[offset:], res.data)
 
-		if res.onDataConsumed != nil {
+		// t.buffer has a fixed location in memory.
+		if &res.data[0] == &t.buffer[PacketStartOffset] {
 			// We are done with t.buffer. Let poll() re-use it.
-			res.onDataConsumed()
+			t.sendBufferConsumed()
 		}
 	}
 
@@ -793,7 +791,6 @@ func (t *Wrapper) WriteV(buffs [][]byte, offset int) (int, error) {
 	metricPacketIn.Add(int64(len(buffs)))
 	swallowed := 0
 	if !t.disableFilter {
-		// TODO(jwhited): this is broken and dropping unnecessarily, fix it
 		for i := range buffs {
 			if t.filterIn(buffs[i][offset:]) != filter.Accept {
 				metricPacketInDrop.Add(1)
