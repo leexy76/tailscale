@@ -826,17 +826,17 @@ func (t *Wrapper) WriteV(buffs [][]byte, offset int) (int, error) {
 	}
 
 	t.noteActivity()
-	total, err := t.tdevWriteV(&buffs, offset)
+	total, err := t.tdevWriteV(buffs, offset)
 	return total + swallowed, err
 }
 
-func (t *Wrapper) tdevWriteV(buffs *[][]byte, offset int) (int, error) {
+func (t *Wrapper) tdevWriteV(buffs [][]byte, offset int) (int, error) {
 	if t.stats.enabled.Load() {
-		for i := range *buffs {
-			t.stats.UpdateRx((*buffs)[i][offset:])
+		for i := range buffs {
+			t.stats.UpdateRx((buffs)[i][offset:])
 		}
 	}
-	return t.tdev.(tun.VectorDevice).WriteV(*buffs, offset)
+	return t.tdev.(tun.VectorDevice).WriteV(buffs, offset)
 }
 
 // Write accepts an incoming packet. The packet begins at buf[offset:],
@@ -868,7 +868,9 @@ func (t *Wrapper) Write(buf []byte, offset int) (int, error) {
 }
 
 func (t *Wrapper) tdevWrite(buf []byte, offset int) (int, error) {
-	// TODO(jwhited): injected writes while in vector mode should funnel to t.tdevWriteV()
+	if t.Mode() == tun.VectorOnly {
+		return t.tdevWriteV([][]byte{buf}, offset) // TODO(jwhited): heap?
+	}
 	if t.stats.enabled.Load() {
 		t.stats.UpdateRx(buf[offset:])
 	}
