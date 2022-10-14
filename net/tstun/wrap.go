@@ -812,14 +812,17 @@ func (t *Wrapper) WriteV(buffs [][]byte, offset int) (int, error) {
 	metricPacketIn.Add(int64(len(buffs)))
 	swallowed := 0
 	if !t.disableFilter {
-		for i := range buffs {
-			if t.filterIn(buffs[i][offset:]) != filter.Accept {
+		i := 0
+		for _, buff := range buffs {
+			if t.filterIn(buff[offset:]) != filter.Accept {
 				metricPacketInDrop.Add(1)
-				swallowed += len(buffs[i][offset:])
-				// TODO(jwhited): fix cut while iterating
-				//buffs = append(buffs[:i], buffs[i+1:]...)
+				swallowed += len(buff[offset:])
+			} else {
+				buffs[i] = buff
+				i++
 			}
 		}
+		buffs = buffs[:i]
 	}
 
 	t.noteActivity()
