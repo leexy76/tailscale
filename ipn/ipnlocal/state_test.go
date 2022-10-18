@@ -247,6 +247,11 @@ func (cc *mockControl) SetNetInfo(ni *tailcfg.NetInfo) {
 	cc.called("SetNetInfo")
 }
 
+func (cc *mockControl) SetTKAHead(head string) {
+	cc.logf("SetTKAHead: %s", head)
+	cc.called("SetTKAHead")
+}
+
 func (cc *mockControl) UpdateEndpoints(endpoints []tailcfg.Endpoint) {
 	// validate endpoint information here?
 	cc.logf("UpdateEndpoints:  ep=%v", endpoints)
@@ -472,7 +477,7 @@ func TestStateMachine(t *testing.T) {
 		// wait until it gets into Starting.
 		// TODO: (Currently this test doesn't detect that bug, but
 		// it's visible in the logs)
-		cc.assertCalls("unpause", "unpause", "unpause")
+		cc.assertCalls("SetTKAHead", "unpause", "unpause", "unpause")
 		c.Assert(nn[0].LoginFinished, qt.IsNotNil)
 		c.Assert(nn[1].Prefs, qt.IsNotNil)
 		c.Assert(nn[2].State, qt.IsNotNil)
@@ -494,7 +499,7 @@ func TestStateMachine(t *testing.T) {
 	})
 	{
 		nn := notifies.drain(1)
-		cc.assertCalls("unpause", "unpause", "unpause")
+		cc.assertCalls("SetTKAHead", "unpause", "unpause", "unpause")
 		c.Assert(nn[0].State, qt.IsNotNil)
 		c.Assert(ipn.Starting, qt.Equals, *nn[0].State)
 	}
@@ -691,7 +696,7 @@ func TestStateMachine(t *testing.T) {
 	})
 	{
 		nn := notifies.drain(3)
-		cc.assertCalls("unpause", "unpause", "unpause")
+		cc.assertCalls("SetTKAHead", "unpause", "unpause", "unpause")
 		c.Assert(nn[0].LoginFinished, qt.IsNotNil)
 		c.Assert(nn[1].Prefs, qt.IsNotNil)
 		c.Assert(nn[2].State, qt.IsNotNil)
@@ -755,7 +760,7 @@ func TestStateMachine(t *testing.T) {
 	})
 	{
 		notifies.drain(0)
-		cc.assertCalls("pause", "pause")
+		cc.assertCalls("SetTKAHead", "pause", "pause")
 	}
 
 	// Request connection.
@@ -829,7 +834,7 @@ func TestStateMachine(t *testing.T) {
 		//  and !WantRunning. But since it's a fresh and successful
 		//  new login, WantRunning is true, so there was never a
 		//  reason to pause().
-		cc.assertCalls("pause", "unpause", "unpause")
+		cc.assertCalls("SetTKAHead", "pause", "unpause", "unpause")
 		c.Assert(nn[0].LoginFinished, qt.IsNotNil)
 		c.Assert(nn[1].Prefs, qt.IsNotNil)
 		c.Assert(nn[2].State, qt.IsNotNil)
@@ -867,7 +872,7 @@ func TestStateMachine(t *testing.T) {
 	})
 	{
 		nn := notifies.drain(1)
-		cc.assertCalls("unpause", "unpause", "unpause")
+		cc.assertCalls("SetTKAHead", "unpause", "unpause", "unpause")
 		// NOTE: No LoginFinished message since no interactive
 		// login was needed.
 		c.Assert(nn[0].State, qt.IsNotNil)
@@ -885,7 +890,7 @@ func TestStateMachine(t *testing.T) {
 	})
 	{
 		nn := notifies.drain(1)
-		cc.assertCalls("unpause", "unpause")
+		cc.assertCalls("SetTKAHead", "unpause", "unpause")
 		c.Assert(nn[0].State, qt.IsNotNil)
 		c.Assert(ipn.NeedsLogin, qt.Equals, *nn[0].State)
 		c.Assert(ipn.NeedsLogin, qt.Equals, b.State())
@@ -900,7 +905,7 @@ func TestStateMachine(t *testing.T) {
 	})
 	{
 		nn := notifies.drain(1)
-		cc.assertCalls("unpause", "unpause", "unpause")
+		cc.assertCalls("SetTKAHead", "unpause", "unpause", "unpause")
 		c.Assert(nn[0].State, qt.IsNotNil)
 		c.Assert(ipn.Starting, qt.Equals, *nn[0].State)
 		c.Assert(ipn.Starting, qt.Equals, b.State())

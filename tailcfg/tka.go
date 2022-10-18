@@ -86,9 +86,6 @@ type TKAInfo struct {
 	//
 	// If the Head state differs to that known locally, the node should perform
 	// synchronization via a separate RPC.
-	//
-	// TODO(tom): Implement AUM synchronization as noise endpoints
-	// /machine/tka/sync/offer & /machine/tka/sync/send.
 	Head string `json:",omitempty"`
 
 	// Disabled indicates the control plane believes TKA should be disabled,
@@ -97,9 +94,6 @@ type TKAInfo struct {
 	// disable TKA locally.
 	// This field exists to disambiguate a nil TKAInfo in a delta mapresponse
 	// from a nil TKAInfo indicating TKA should be disabled.
-	//
-	// TODO(tom): Implement /machine/tka/bootstrap as a noise endpoint, to
-	// communicate the genesis AUM & any disablement secrets.
 	Disabled bool `json:",omitempty"`
 }
 
