@@ -3357,6 +3357,7 @@ type endpoint struct {
 	// See #540 for background.
 	heartbeatDisabled bool
 	pathFinderRunning bool
+	lastSendAtomic    syncs.AtomicValue[mono.Time] // last time endpoint.send was called
 }
 
 type pendingCLIPing struct {
@@ -3648,6 +3649,9 @@ func (de *endpoint) cliPing(res *ipnstate.PingResult, cb func(*ipnstate.PingResu
 }
 
 func (de *endpoint) send(b []byte) error {
+	now := mono.Now()
+	de.lastSendAtomic.Store(now)
+
 	if fn := de.sendFunc.Load(); fn != nil {
 		return fn(b)
 	}
@@ -3661,7 +3665,6 @@ func (de *endpoint) send(b []byte) error {
 		}
 	}
 
-	now := mono.Now()
 	udpAddr, derpAddr := de.addrForSendLocked(now)
 	if de.canP2P() && (!udpAddr.IsValid() || now.After(de.trustBestAddrUntil)) {
 		de.sendPingsLocked(now, true)
