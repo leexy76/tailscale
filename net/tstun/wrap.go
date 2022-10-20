@@ -132,8 +132,8 @@ type Wrapper struct {
 	// Close closes outbound and sets outboundClosed to true.
 	outbound chan tunReadResult
 	// vectorOutbound behaves like outbound, but is for vectors or single packet
-	// reads/injections.
-	vectorOutbound chan tunReadOpResult
+	// injections.
+	vectorOutbound chan tunVectorReadResult
 
 	// eventsUpDown yields up and down tun.Events that arrive on a Wrapper's events channel.
 	eventsUpDown chan tun.Event
@@ -188,13 +188,6 @@ type Wrapper struct {
 	}
 }
 
-// tunReadOpResult enables the passing of tunReadResult & tunVectorReadResult
-// types on the same channel, which allows us to avoid multi-channel select when
-// mixing vector and single packet operations.
-type tunReadOpResult interface {
-	isTunReadOpResult()
-}
-
 // tunReadResult is the result of a tun.Read(), or an injected result pretending
 // to be a tun.Read().
 type tunReadResult struct {
@@ -211,12 +204,17 @@ type tunReadResult struct {
 
 func (t tunReadResult) isTunReadOpResult() {}
 
-// tunVectorReadResult is the result of a tun.ReadV().
+// tunVectorReadResult is the result of a tun.ReadV(), or an injected result
+// pretending to be a tun.ReadV().
 type tunVectorReadResult struct {
-	// Only one of err or data should be set, and are read in that order of
-	// precedence.
-	err        error
-	data       [][]byte
+	// Only one of err, data, or single should be set, and are read in that
+	// order of precedence.
+	err  error
+	data [][]byte
+	// single enables single packet injections without allocating slices on the
+	// heap
+	single tunReadResult
+
 	dataOffset int
 	dataSizes  []int
 }
@@ -244,7 +242,7 @@ func wrap(logf logger.Logf, tdev tun.Device, isTAP bool) *Wrapper {
 		closed:         make(chan struct{}),
 		// outbound can be unbuffered; the buffer is an optimization.
 		outbound:       make(chan tunReadResult, 1),
-		vectorOutbound: make(chan tunReadOpResult, 1),
+		vectorOutbound: make(chan tunVectorReadResult, 1),
 		eventsUpDown:   make(chan tun.Event),
 		eventsOther:    make(chan tun.Event),
 		// TODO(dmytro): (highly rate-limited) hexdumps should happen on unknown packets.
@@ -494,7 +492,9 @@ func (t *Wrapper) sendOutbound(r tunReadResult) {
 		return
 	}
 	if t.Mode() == tun.VectorOnly {
-		t.vectorOutbound <- r
+		t.vectorOutbound <- tunVectorReadResult{
+			single: r,
+		}
 	} else {
 		t.outbound <- r
 	}
@@ -596,18 +596,16 @@ func (t *Wrapper) Mode() tun.VectorMode {
 }
 
 func (t *Wrapper) ReadV(buffs [][]byte, offset int) ([]int, error) {
-	op, ok := <-t.vectorOutbound
+	res, ok := <-t.vectorOutbound
 	if !ok {
 		return nil, io.EOF
 	}
-	single, ok := op.(tunReadResult)
-	if ok {
-		n, err := t.read(single, buffs[0], offset)
-		return []int{n}, err // TODO(jwhited): heap?
-	}
-	res, _ := op.(tunVectorReadResult)
 	if res.err != nil {
 		return nil, res.err
+	}
+	if res.data == nil {
+		n, err := t.read(res.single, buffs[0], offset)
+		return []int{n}, err // TODO(jwhited): heap?
 	}
 
 	metricPacketOut.Add(int64(len(res.data)))
