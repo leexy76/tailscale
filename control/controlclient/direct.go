@@ -317,10 +317,10 @@ func (c *Direct) SetNetInfo(ni *tailcfg.NetInfo) bool {
 	return true
 }
 
-func (c *Direct) GetPersist() persist.Persist {
+func (c *Direct) GetPersist() persist.PersistView {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.persist
+	return c.persist.View()
 }
 
 func (c *Direct) TryLogout(ctx context.Context) error {

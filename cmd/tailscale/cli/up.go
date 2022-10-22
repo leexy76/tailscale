@@ -632,7 +632,6 @@ func runUp(ctx context.Context, args []string) (retErr error) {
 			return err
 		}
 		opts := ipn.Options{
-			StateKey:    ipn.GlobalDaemonStateKey,
 			AuthKey:     authKey,
 			UpdatePrefs: prefs,
 		}
@@ -647,7 +646,6 @@ func runUp(ctx context.Context, args []string) (retErr error) {
 		if effectiveGOOS() == "windows" {
 			// The Windows service will set this as needed based
 			// on our connection's identity.
-			opts.StateKey = ""
 			opts.Prefs = prefs
 		}
 
