@@ -67,7 +67,7 @@ type Notify struct {
 
 	LoginFinished *empty.Message     // non-nil when/if the login process succeeded
 	State         *State             // if non-nil, the new or current IPN state
-	Prefs         *Prefs             // if non-nil, the new or current preferences
+	Prefs         PrefsView          // if valid, the new or current preferences
 	NetMap        *netmap.NetworkMap // if non-nil, the new or current netmap
 	Engine        *EngineStatus      // if non-nil, the new or current wireguard stats
 	BrowseToURL   *string            // if non-nil, UI should open a browser right now
@@ -106,7 +106,7 @@ func (n Notify) String() string {
 	if n.State != nil {
 		fmt.Fprintf(&sb, "state=%v ", *n.State)
 	}
-	if n.Prefs != nil {
+	if n.Prefs.Valid() {
 		fmt.Fprintf(&sb, "%v ", n.Prefs.Pretty())
 	}
 	if n.NetMap != nil {
@@ -178,21 +178,11 @@ type StateKey string
 type Options struct {
 	// FrontendLogID is the public logtail id used by the frontend.
 	FrontendLogID string
-	// StateKey and Prefs together define the state the backend should
-	// use:
-	//  - StateKey=="" && Prefs!=nil: use Prefs for internal state,
-	//    don't persist changes in the backend, except for the machine key
-	//    for migration purposes.
-	//  - StateKey!="" && Prefs==nil: load the given backend-side
-	//    state and use/update that.
-	//  - StateKey!="" && Prefs!=nil: like the previous case, but do
-	//    an initial overwrite of backend state with Prefs.
-	//
-	// NOTE(apenwarr): The above means that this Prefs field does not do
-	// what you probably think it does. It will overwrite your encryption
-	// keys. Do not use unless you know what you're doing.
-	StateKey StateKey
-	Prefs    *Prefs
+	// Prefs is the initial preferences to use. If nil, the current
+	// profile's preferences are loaded from the store.
+	// If non-nil, the Prefs are used as-is, and the state store is
+	// updated to match.
+	Prefs *Prefs
 	// UpdatePrefs, if provided, overrides Options.Prefs *and* the Prefs
 	// already stored in the backend state, *except* for the Persist
 	// Persist member. If you just want to provide prefs, this is

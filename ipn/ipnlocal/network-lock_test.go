@@ -20,12 +20,14 @@ import (
 	"tailscale.com/envknob"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
+	"tailscale.com/ipn/store/mem"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tka"
 	"tailscale.com/types/key"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/persist"
 	"tailscale.com/types/tkatype"
+	"tailscale.com/util/must"
 )
 
 func fakeControlClient(t *testing.T, c *http.Client) *controlclient.Auto {
@@ -117,14 +119,17 @@ func TestTKAEnablementFlow(t *testing.T) {
 	temp := t.TempDir()
 
 	cc := fakeControlClient(t, client)
+	pm := must.Get(NewProfileManager(new(mem.Store), t.Logf, ""))
+	must.Do(pm.SetPrefs(&ipn.Prefs{
+		Persist: &persist.Persist{PrivateNodeKey: nodePriv},
+	}))
 	b := LocalBackend{
 		varRoot: temp,
 		cc:      cc,
 		ccAuto:  cc,
 		logf:    t.Logf,
-		prefs: &ipn.Prefs{
-			Persist: &persist.Persist{PrivateNodeKey: nodePriv},
-		},
+		pm:      pm,
+		store:   pm.Store(),
 	}
 
 	err = b.tkaSyncIfNeeded(&netmap.NetworkMap{
@@ -210,6 +215,10 @@ func TestTKADisablementFlow(t *testing.T) {
 	defer ts.Close()
 
 	cc := fakeControlClient(t, client)
+	pm := must.Get(NewProfileManager(new(mem.Store), t.Logf, ""))
+	must.Do(pm.SetPrefs(&ipn.Prefs{
+		Persist: &persist.Persist{PrivateNodeKey: nodePriv},
+	}))
 	b := LocalBackend{
 		varRoot: temp,
 		cc:      cc,
@@ -219,9 +228,8 @@ func TestTKADisablementFlow(t *testing.T) {
 			authority: authority,
 			storage:   chonk,
 		},
-		prefs: &ipn.Prefs{
-			Persist: &persist.Persist{PrivateNodeKey: nodePriv},
-		},
+		pm:    pm,
+		store: pm.Store(),
 	}
 
 	// Test that the wrong disablement secret does not shut down the authority.
@@ -447,17 +455,20 @@ func TestTKASync(t *testing.T) {
 
 			// Setup the client.
 			cc := fakeControlClient(t, client)
+			pm := must.Get(NewProfileManager(new(mem.Store), t.Logf, ""))
+			must.Do(pm.SetPrefs(&ipn.Prefs{
+				Persist: &persist.Persist{PrivateNodeKey: nodePriv},
+			}))
 			b := LocalBackend{
 				varRoot: temp,
 				cc:      cc,
 				ccAuto:  cc,
 				logf:    t.Logf,
+				pm:      pm,
+				store:   pm.Store(),
 				tka: &tkaState{
 					authority: nodeAuthority,
 					storage:   nodeStorage,
-				},
-				prefs: &ipn.Prefs{
-					Persist: &persist.Persist{PrivateNodeKey: nodePriv},
 				},
 			}
 

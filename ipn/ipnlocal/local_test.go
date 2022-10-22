@@ -21,6 +21,7 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
+	"tailscale.com/util/must"
 	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/wgcfg"
 )
@@ -488,7 +489,8 @@ func TestLazyMachineKeyGeneration(t *testing.T) {
 		t.Fatalf("NewFakeUserspaceEngine: %v", err)
 	}
 	t.Cleanup(eng.Close)
-	lb, err := NewLocalBackend(logf, "logid", store, nil, eng, 0)
+	pm := must.Get(NewProfileManager(store, logf, "default"))
+	lb, err := NewLocalBackend(logf, "logid", pm, nil, eng, 0)
 	if err != nil {
 		t.Fatalf("NewLocalBackend: %v", err)
 	}
@@ -497,9 +499,7 @@ func TestLazyMachineKeyGeneration(t *testing.T) {
 		Transport: panicOnUseTransport{}, // validate we don't send HTTP requests
 	})
 
-	if err := lb.Start(ipn.Options{
-		StateKey: ipn.GlobalDaemonStateKey,
-	}); err != nil {
+	if err := lb.Start(ipn.Options{}); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 

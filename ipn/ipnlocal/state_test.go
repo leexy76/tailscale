@@ -22,6 +22,7 @@ import (
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/persist"
+	"tailscale.com/util/must"
 	"tailscale.com/wgengine"
 )
 
@@ -96,7 +97,7 @@ type mockControl struct {
 	mu          sync.Mutex
 	calls       []string
 	authBlocked bool
-	persist     persist.Persist
+	persist     *persist.Persist
 	machineKey  key.MachinePrivate
 }
 
@@ -124,7 +125,7 @@ func (cc *mockControl) populateKeys() (newKeys bool) {
 		newKeys = true
 	}
 
-	if cc.persist.PrivateNodeKey.IsZero() {
+	if cc.persist != nil && cc.persist.PrivateNodeKey.IsZero() {
 		cc.logf("Generating a new nodekey.")
 		cc.persist.OldPrivateNodeKey = cc.persist.PrivateNodeKey
 		cc.persist.PrivateNodeKey = key.NewNode()
@@ -141,7 +142,7 @@ func (cc *mockControl) send(err error, url string, loginFinished bool, nm *netma
 		s := controlclient.Status{
 			URL:     url,
 			NetMap:  nm,
-			Persist: &cc.persist,
+			Persist: cc.persist,
 			Err:     err,
 		}
 		if loginFinished {
@@ -284,8 +285,9 @@ func TestStateMachine(t *testing.T) {
 		t.Fatalf("NewFakeUserspaceEngine: %v", err)
 	}
 	t.Cleanup(e.Close)
+	pm := must.Get(NewProfileManager(store, logf, "default"))
 
-	b, err := NewLocalBackend(logf, "logid", store, nil, e, 0)
+	b, err := NewLocalBackend(logf, "logid", pm, nil, e, 0)
 	if err != nil {
 		t.Fatalf("NewLocalBackend: %v", err)
 	}
@@ -299,7 +301,7 @@ func TestStateMachine(t *testing.T) {
 		cc.opts = opts
 		cc.logfActual = opts.Logf
 		cc.authBlocked = true
-		cc.persist = cc.opts.Persist
+		cc.persist = &cc.opts.Persist
 		cc.mu.Unlock()
 
 		cc.logf("ccGen: new mockControl.")
@@ -315,7 +317,7 @@ func TestStateMachine(t *testing.T) {
 			return
 		}
 		if n.State != nil ||
-			n.Prefs != nil ||
+			n.Prefs.Valid() ||
 			n.BrowseToURL != nil ||
 			n.LoginFinished != nil {
 			logf("\n%v\n\n", n)
@@ -335,7 +337,7 @@ func TestStateMachine(t *testing.T) {
 	// but not ask it to do anything yet.
 	t.Logf("\n\nStart")
 	notifies.expect(2)
-	c.Assert(b.Start(ipn.Options{StateKey: ipn.GlobalDaemonStateKey}), qt.IsNil)
+	c.Assert(b.Start(ipn.Options{}), qt.IsNil)
 	{
 		// BUG: strictly, it should pause, not unpause, here, since !WantRunning.
 		cc.assertCalls("New", "unpause")
@@ -344,12 +346,12 @@ func TestStateMachine(t *testing.T) {
 		cc.assertCalls()
 		c.Assert(nn[0].Prefs, qt.IsNotNil)
 		c.Assert(nn[1].State, qt.IsNotNil)
-		prefs := *nn[0].Prefs
+		prefs := nn[0].Prefs
 		// Note: a totally fresh system has Prefs.LoggedOut=false by
 		// default. We are logged out, but not because the user asked
 		// for it, so it doesn't count as Prefs.LoggedOut==true.
-		c.Assert(nn[0].Prefs.LoggedOut, qt.IsFalse)
-		c.Assert(prefs.WantRunning, qt.IsFalse)
+		c.Assert(prefs.LoggedOut(), qt.IsFalse)
+		c.Assert(prefs.WantRunning(), qt.IsFalse)
 		c.Assert(ipn.NeedsLogin, qt.Equals, *nn[1].State)
 		c.Assert(ipn.NeedsLogin, qt.Equals, b.State())
 	}
@@ -360,7 +362,7 @@ func TestStateMachine(t *testing.T) {
 	// events as the first time, so UIs always know what to expect.
 	t.Logf("\n\nStart2")
 	notifies.expect(2)
-	c.Assert(b.Start(ipn.Options{StateKey: ipn.GlobalDaemonStateKey}), qt.IsNil)
+	c.Assert(b.Start(ipn.Options{}), qt.IsNil)
 	{
 		// BUG: strictly, it should pause, not unpause, here, since !WantRunning.
 		cc.assertCalls("Shutdown", "unpause", "New", "unpause")
@@ -369,8 +371,8 @@ func TestStateMachine(t *testing.T) {
 		cc.assertCalls()
 		c.Assert(nn[0].Prefs, qt.IsNotNil)
 		c.Assert(nn[1].State, qt.IsNotNil)
-		c.Assert(nn[0].Prefs.LoggedOut, qt.IsFalse)
-		c.Assert(nn[0].Prefs.WantRunning, qt.IsFalse)
+		c.Assert(nn[0].Prefs.LoggedOut(), qt.IsFalse)
+		c.Assert(nn[0].Prefs.WantRunning(), qt.IsFalse)
 		c.Assert(ipn.NeedsLogin, qt.Equals, *nn[1].State)
 		c.Assert(ipn.NeedsLogin, qt.Equals, b.State())
 	}
@@ -406,8 +408,8 @@ func TestStateMachine(t *testing.T) {
 		nn := notifies.drain(1)
 
 		c.Assert(nn[0].Prefs, qt.IsNotNil)
-		c.Assert(nn[0].Prefs.LoggedOut, qt.IsFalse)
-		c.Assert(nn[0].Prefs.WantRunning, qt.IsFalse)
+		c.Assert(nn[0].Prefs.LoggedOut(), qt.IsFalse)
+		c.Assert(nn[0].Prefs.WantRunning(), qt.IsFalse)
 	}
 
 	// Now we'll try an interactive login.
@@ -476,7 +478,7 @@ func TestStateMachine(t *testing.T) {
 		c.Assert(nn[0].LoginFinished, qt.IsNotNil)
 		c.Assert(nn[1].Prefs, qt.IsNotNil)
 		c.Assert(nn[2].State, qt.IsNotNil)
-		c.Assert(nn[1].Prefs.Persist.LoginName, qt.Equals, "user1")
+		c.Assert(nn[1].Prefs.Persist().LoginName, qt.Equals, "user1")
 		c.Assert(ipn.NeedsMachineAuth, qt.Equals, *nn[2].State)
 	}
 
@@ -552,7 +554,7 @@ func TestStateMachine(t *testing.T) {
 	t.Logf("\n\nFastpath Start()")
 	notifies.expect(1)
 	b.state = ipn.Running
-	c.Assert(b.Start(ipn.Options{StateKey: ipn.GlobalDaemonStateKey}), qt.IsNil)
+	c.Assert(b.Start(ipn.Options{}), qt.IsNil)
 	{
 		nn := notifies.drain(1)
 		cc.assertCalls()
@@ -576,8 +578,8 @@ func TestStateMachine(t *testing.T) {
 		c.Assert(nn[0].State, qt.IsNotNil)
 		c.Assert(nn[1].Prefs, qt.IsNotNil)
 		c.Assert(ipn.Stopped, qt.Equals, *nn[0].State)
-		c.Assert(nn[1].Prefs.LoggedOut, qt.IsTrue)
-		c.Assert(nn[1].Prefs.WantRunning, qt.IsFalse)
+		c.Assert(nn[1].Prefs.LoggedOut(), qt.IsTrue)
+		c.Assert(nn[1].Prefs.WantRunning(), qt.IsFalse)
 		c.Assert(ipn.Stopped, qt.Equals, b.State())
 		c.Assert(store.sawWrite(), qt.IsTrue)
 	}
@@ -662,7 +664,7 @@ func TestStateMachine(t *testing.T) {
 	// The frontend restarts!
 	t.Logf("\n\nStart3")
 	notifies.expect(2)
-	c.Assert(b.Start(ipn.Options{StateKey: ipn.GlobalDaemonStateKey}), qt.IsNil)
+	c.Assert(b.Start(ipn.Options{}), qt.IsNil)
 	{
 		// BUG: We already called Shutdown(), no need to do it again.
 		// BUG: don't unpause because we're not logged in.
@@ -672,8 +674,8 @@ func TestStateMachine(t *testing.T) {
 		cc.assertCalls()
 		c.Assert(nn[0].Prefs, qt.IsNotNil)
 		c.Assert(nn[1].State, qt.IsNotNil)
-		c.Assert(nn[0].Prefs.LoggedOut, qt.IsTrue)
-		c.Assert(nn[0].Prefs.WantRunning, qt.IsFalse)
+		c.Assert(nn[0].Prefs.LoggedOut(), qt.IsTrue)
+		c.Assert(nn[0].Prefs.WantRunning(), qt.IsFalse)
 		c.Assert(ipn.NeedsLogin, qt.Equals, *nn[1].State)
 		c.Assert(ipn.NeedsLogin, qt.Equals, b.State())
 	}
@@ -696,9 +698,9 @@ func TestStateMachine(t *testing.T) {
 		c.Assert(nn[1].Prefs, qt.IsNotNil)
 		c.Assert(nn[2].State, qt.IsNotNil)
 		// Prefs after finishing the login, so LoginName updated.
-		c.Assert(nn[1].Prefs.Persist.LoginName, qt.Equals, "user2")
-		c.Assert(nn[1].Prefs.LoggedOut, qt.IsFalse)
-		c.Assert(nn[1].Prefs.WantRunning, qt.IsTrue)
+		c.Assert(nn[1].Prefs.Persist().LoginName, qt.Equals, "user2")
+		c.Assert(nn[1].Prefs.LoggedOut(), qt.IsFalse)
+		c.Assert(nn[1].Prefs.WantRunning(), qt.IsTrue)
 		c.Assert(ipn.Starting, qt.Equals, *nn[2].State)
 	}
 
@@ -716,13 +718,13 @@ func TestStateMachine(t *testing.T) {
 		c.Assert(nn[0].State, qt.IsNotNil)
 		c.Assert(nn[1].Prefs, qt.IsNotNil)
 		c.Assert(ipn.Stopped, qt.Equals, *nn[0].State)
-		c.Assert(nn[1].Prefs.LoggedOut, qt.IsFalse)
+		c.Assert(nn[1].Prefs.LoggedOut(), qt.IsFalse)
 	}
 
 	// One more restart, this time with a valid key, but WantRunning=false.
 	t.Logf("\n\nStart4")
 	notifies.expect(2)
-	c.Assert(b.Start(ipn.Options{StateKey: ipn.GlobalDaemonStateKey}), qt.IsNil)
+	c.Assert(b.Start(ipn.Options{}), qt.IsNil)
 	{
 		// NOTE: cc.Shutdown() is correct here, since we didn't call
 		// b.Shutdown() explicitly ourselves.
@@ -734,8 +736,8 @@ func TestStateMachine(t *testing.T) {
 		cc.assertCalls("Shutdown", "unpause", "New", "Login", "unpause")
 		c.Assert(nn[0].Prefs, qt.IsNotNil)
 		c.Assert(nn[1].State, qt.IsNotNil)
-		c.Assert(nn[0].Prefs.WantRunning, qt.IsFalse)
-		c.Assert(nn[0].Prefs.LoggedOut, qt.IsFalse)
+		c.Assert(nn[0].Prefs.WantRunning(), qt.IsFalse)
+		c.Assert(nn[0].Prefs.LoggedOut(), qt.IsFalse)
 		c.Assert(ipn.Stopped, qt.Equals, *nn[1].State)
 	}
 
@@ -834,9 +836,9 @@ func TestStateMachine(t *testing.T) {
 		c.Assert(nn[1].Prefs, qt.IsNotNil)
 		c.Assert(nn[2].State, qt.IsNotNil)
 		// Prefs after finishing the login, so LoginName updated.
-		c.Assert(nn[1].Prefs.Persist.LoginName, qt.Equals, "user3")
-		c.Assert(nn[1].Prefs.LoggedOut, qt.IsFalse)
-		c.Assert(nn[1].Prefs.WantRunning, qt.IsTrue)
+		c.Assert(nn[1].Prefs.Persist().LoginName, qt.Equals, "user3")
+		c.Assert(nn[1].Prefs.LoggedOut(), qt.IsFalse)
+		c.Assert(nn[1].Prefs.WantRunning(), qt.IsTrue)
 		c.Assert(ipn.Starting, qt.Equals, *nn[2].State)
 	}
 
@@ -844,7 +846,7 @@ func TestStateMachine(t *testing.T) {
 	// logged in and WantRunning.
 	t.Logf("\n\nStart5")
 	notifies.expect(1)
-	c.Assert(b.Start(ipn.Options{StateKey: ipn.GlobalDaemonStateKey}), qt.IsNil)
+	c.Assert(b.Start(ipn.Options{}), qt.IsNil)
 	{
 		// NOTE: cc.Shutdown() is correct here, since we didn't call
 		// b.Shutdown() ourselves.
@@ -853,8 +855,8 @@ func TestStateMachine(t *testing.T) {
 		nn := notifies.drain(1)
 		cc.assertCalls()
 		c.Assert(nn[0].Prefs, qt.IsNotNil)
-		c.Assert(nn[0].Prefs.LoggedOut, qt.IsFalse)
-		c.Assert(nn[0].Prefs.WantRunning, qt.IsTrue)
+		c.Assert(nn[0].Prefs.LoggedOut(), qt.IsFalse)
+		c.Assert(nn[0].Prefs.WantRunning(), qt.IsTrue)
 		c.Assert(ipn.NoState, qt.Equals, b.State())
 	}
 
@@ -951,7 +953,8 @@ func TestWGEngineStatusRace(t *testing.T) {
 	eng, err := wgengine.NewFakeUserspaceEngine(logf, 0)
 	c.Assert(err, qt.IsNil)
 	t.Cleanup(eng.Close)
-	b, err := NewLocalBackend(logf, "logid", new(mem.Store), nil, eng, 0)
+	pm := must.Get(NewProfileManager(new(mem.Store), logf, ""))
+	b, err := NewLocalBackend(logf, "logid", pm, nil, eng, 0)
 	c.Assert(err, qt.IsNil)
 
 	cc := newMockControl(t)
@@ -976,7 +979,7 @@ func TestWGEngineStatusRace(t *testing.T) {
 	wantState(ipn.NoState)
 
 	// Start the backend.
-	err = b.Start(ipn.Options{StateKey: ipn.GlobalDaemonStateKey})
+	err = b.Start(ipn.Options{})
 	c.Assert(err, qt.IsNil)
 	wantState(ipn.NeedsLogin)
 
