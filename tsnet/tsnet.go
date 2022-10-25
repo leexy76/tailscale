@@ -497,7 +497,7 @@ func (s *Server) APIClient() (*tailscale.Client, error) {
 	if nm == nil {
 		return nil, errors.New("no netmap, not logged in?")
 	}
-	c := tailscale.NewNoiseClient(nm.Domain, s.lb.NoiseRoundTripper(), nm.NodeKey)
+	c := tailscale.NewNoiseClient(nm.Domain, s.lb.NoiseRoundTripper(), s.lb.APIOverNoiseClientState)
 	return c, nil
 }
 

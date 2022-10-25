@@ -13,6 +13,7 @@
 package tailscale
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -95,12 +96,24 @@ func (c *Client) setAuth(r *http.Request) {
 
 // nodeKeyAuth is an AuthMethod for NewClient that authenticates requests
 // using a node key over the Noise protocol.
-type nodeKeyAuth key.NodePublic
+type nodeKeyAuth struct {
+	state func() (_ key.NodePrivate, _ key.ChallengePublic, ok bool)
+}
 
-func (k nodeKeyAuth) modifyRequest(req *http.Request) {
+func (k *nodeKeyAuth) modifyRequest(req *http.Request) {
+	priv, chalPub, ok := k.state()
+	if !ok {
+		// TODO(bradfitz): return an error?
+		return
+	}
 	// QueryEscape the node key since it has a colon in it.
-	nk := url.QueryEscape(key.NodePublic(k).String())
+	nk := url.QueryEscape(priv.Public().String())
 	req.SetBasicAuth(nk, "")
+
+	// TODO(bradfitz): cache this base64ed box of SealToChallenge on nodeKeyAuth.
+	box := priv.SealToChallenge(chalPub, []byte(chalPub.String()))
+	req.Header.Set("Tailscale-Node-Proof",
+		priv.Public().String()+" "+base64.StdEncoding.EncodeToString(box))
 }
 
 // NewNoiseClient is a convenience method for instantiating a new Client
@@ -108,10 +121,10 @@ func (k nodeKeyAuth) modifyRequest(req *http.Request) {
 //
 // tailnet is the globally unique identifier for a Tailscale network, such
 // as "example.com" or "user@gmail.com".
-func NewNoiseClient(tailnet string, noiseRoundTripper http.RoundTripper, nk key.NodePublic) *Client {
+func NewNoiseClient(tailnet string, noiseRoundTripper http.RoundTripper, state func() (key.NodePrivate, key.ChallengePublic, bool)) *Client {
 	return &Client{
 		tailnet:    tailnet,
-		auth:       nodeKeyAuth(nk),
+		auth:       &nodeKeyAuth{state: state},
 		HTTPClient: &http.Client{Transport: noiseRoundTripper},
 	}
 }

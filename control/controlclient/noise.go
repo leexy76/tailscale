@@ -34,6 +34,15 @@ type noiseConn struct {
 	*controlbase.Conn
 	id   int
 	pool *noiseClient
+
+	// untrustedChalPub is the public key (if any) seen during the noise
+	// upgrade. If present it can be used to avoid a round-trip and
+	// a node key proof challenge in the first HTTP request without
+	// having to discover the challenge first. Note that this arrives
+	// over an untrusted challenge (e.g. HTTP port 80) so it might've
+	// been tampered with or removed. In either case, another roundtrip
+	// will be needed to fetch the challenge over the noise channel.
+	untrustedChalPub key.ChallengePublic
 }
 
 func (c *noiseConn) Close() error {
@@ -224,9 +233,20 @@ func (nc *noiseClient) dial(_, _ string, _ *tls.Config) (net.Conn, error) {
 		return nil, err
 	}
 
+	chalKeyStr := clientConn.UntrustedUpgradeHeaders.Get("Tailscale-Node-Challenge-Key")
+	var chalPub key.ChallengePublic
+	if chalKeyStr != "" {
+		chalPub.UnmarshalText([]byte(chalKeyStr)) // best effort
+	}
+
 	nc.mu.Lock()
 	defer nc.mu.Unlock()
-	ncc := &noiseConn{Conn: clientConn.Conn, id: connID, pool: nc}
+	ncc := &noiseConn{
+		Conn:             clientConn.Conn,
+		id:               connID,
+		pool:             nc,
+		untrustedChalPub: chalPub,
+	}
 	mak.Set(&nc.connPool, ncc.id, ncc)
 	return ncc, nil
 }

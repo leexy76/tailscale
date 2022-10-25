@@ -2385,6 +2385,17 @@ func (b *LocalBackend) NetMap() *netmap.NetworkMap {
 	return b.netMap
 }
 
+func (b *LocalBackend) APIOverNoiseClientState() (_ key.NodePrivate, _ key.ChallengePublic, ok bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.netMap == nil || b.blocked || !b.prefs.Valid() || b.prefs.Persist() == nil {
+		return
+	}
+	priv := b.prefs.Persist().PrivateNodeKey
+	chalPub := key.ChallengePublic{} // TODO(bradfitz): XXX
+	return priv, chalPub, true
+}
+
 func (b *LocalBackend) isEngineBlocked() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
